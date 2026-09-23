@@ -5,7 +5,6 @@
 - `presentation/` – Defense slides
 - `experiments/` – Experimental results and analysis
 - `figures/` – Images used in the thesis
-- `code/` – Information about the implementation
 
 ## Implementation
 The source code used in this thesis is available at:
