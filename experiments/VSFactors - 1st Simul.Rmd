@@ -1,0 +1,534 @@
+---
+title: "VSFactors - 1st Simul"
+author: "David Baptista"
+output: html_document
+---
+
+WARNING: computations were made using a HAL server. Local machine is only useful if smaller experiments are made or for your personal use
+```{r Package Load/Install}
+# -----------------------------------------
+# Local Machine (directly from GitHub)
+# -----------------------------------------
+#remove.packages ("BAS", source = "CRAN")
+#devtools::install_github (
+#  "davidembb20/BAS",
+#  ref = "costs_and_factors",
+#  force = TRUE
+#)
+# -----------------------------------------
+# HAL server
+# -----------------------------------------
+# e.g., download the package from GitHub to your local machine and then to the server, and set that folder as wd
+#install.packages (".", repos = NULL, type = "source")
+# -----------------------------------------
+
+Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1") # Faster parallel computing
+# to use with multisession, deliberately (not multicore), so that workers don´t end up fighting over cores.
+library (BAS)
+```
+
+# 1st Experiment: VSFactors
+What happens when increase the number of spurious factors are increased?
+3 different scenarios are tested. For each, $n = 300$, and there are $p$ factors, all with the same number of levels, $l_j = 4$. Across all scenarios, there are only two active factors. The rest $p-2$ factors are spurious. Scenarios: $p \in \{ 5,15,27 \}$. Each experiment is repeated 10 times (which means there is a total of 30 simulated datasets, 10 per each value of $p$).
+```{r Options}
+lj <- 4 # Number of levels
+n <- 300 # Sample size
+alpha <- 1 # Intercept
+
+intensity <- 0.50
+beta1 <- c(-1.08, -.84, -.74, .63) * intensity
+beta2 <- c(-0.51 * intensity, .41, .18, .07)
+
+# Model Space Priors
+mp <- list(
+  CC   = BAS:::CC(),
+  SBC  = BAS:::SBC(),
+  SBSB = BAS:::SBSB()
+)
+
+metodo <- "GibbsBVS" # GibbsBVS, deterministic
+machine <- "server" # server, local
+master_seed <- 1234
+
+num_p <- list(
+  p5 = 5,
+  p15 = 15,
+  p27 = 27
+)
+
+num_iter <- 10
+
+# Cartesian Product (df)
+scenarios1 <- expand.grid(
+  p_val = unlist(num_p),
+  simulation_id  = seq_len(num_iter)
+)
+```
+
+```{r Priors on Model Parameters}
+priors_on_beta <- list(
+  robust       = BAS::robust(n = n) #,
+  # intrinsic    = BAS::intrinsic(n = n),
+  # beta_prime   = BAS::beta.prime(n = n),
+  # CH_a05_bn    = BAS::CCH(alpha = 1 / 2, beta = n),
+  # CH_a1_bn     = BAS::CCH(alpha = 1, beta = n),
+  # CH_a05_b05n  = BAS::CCH(alpha = 1 / 2, beta = n / 2),
+  # CH_a1_b05n   = BAS::CCH(alpha = 1, beta = n / 2),
+  # unit_inf_DBF = BAS::g.prior(g = n),
+  # unit_inf_TBF = BAS::testBF.prior(g = n),
+  # ZS_adapted   = BAS::CCH(alpha = 1, beta = 2, s = n + 3),
+  # benchmark    = BAS::CCH(alpha = 0.02, beta = 0.02 * max(n, p^2)), # need to define p before this if used; with the recommended c = 0.01;
+  # hyper_gn     = BAS::hyper.g.n(alpha = 3), # special case of the robust prior...
+  # BIC          = BAS::bic.prior(n), # favors small models
+	# AIC          = BAS::aic.prior(), # favours large models
+  # local_eb     = BAS::EB.local() # tends to favor large models
+)
+```
+
+```{r Simulated Data with Parallel}
+library(future.apply)
+library(dplyr)
+
+# multisession, deliberately, not multicore: a fork inherits an already
+# multi-threaded BLAS, and workers end up fighting over cores.
+plan(multisession, workers = num_iter)
+
+sim_list <- future_lapply(
+  seq_len(num_iter), # 10 datasets
+  function(j) {
+
+    # Design matrix
+    X <- matrix(
+      sample(seq_len(lj), size = n * (25 + 2), replace = TRUE),
+      nrow = n,
+      ncol = (25 + 2) # Maximum number of competing factors
+    )
+
+    # Overparameterized design matriz
+    X_over <- matrix(0, nrow = n, ncol = (25 + 2) * lj)
+
+    # One-hot encoding
+    for (k in seq_len(ncol(X))) {
+      # Sequence of columns in X_over corresponding to the k-th column in X (k-th factor)
+      # When lj = 4 => if k=1, cols = 1:4; if k=2, cols = 5:8, etc.
+      # cols <- (k - 1) * lj + 1:lj
+      # print (cols)
+
+      # So, (k - 1) * lj + X[, k] gives the exact column index in X_over
+      # where the "1" should go for each row 
+           
+      # cbind(1:n, ...) creates those (row, column) index pairs
+      X_over[cbind(1:n, (k - 1) * lj + X[, k])] <- 1 # Other positions remain 0 
+    }
+
+    beta <- c(beta1[seq_len(lj)], beta2[seq_len(lj)], rep(0, 25 * lj))
+    eta <- alpha + X_over %*% beta # Linear predictor
+  
+    y <- rpois (n, lambda = exp(eta)) # Poisson with log link
+    # y <- rbinom(n, size = 1, prob = plogis(eta))
+    # y <- rexp (n, rate = exp(eta)) # Exponential with log link
+
+    sim_data <- as.data.frame(X) |>
+      dplyr :: mutate(dplyr :: across(everything(), as.factor)) |> # character to factor 
+      setNames(paste0("A", seq_len(ncol(X)))) |> # colNames
+      mutate(y = y, .before = 1)
+  
+    sim_data
+
+  },
+  future.seed = master_seed # 1234
+)
+
+plan (sequential)
+```
+
+```{r Build Formulas}
+# No need to include the intercept
+build_formula <- function(p) {
+  vars <- paste0("A", seq_len(p))
+  formula <- as.formula(
+    paste("y ~", paste(vars, collapse = " + "))
+  )
+  return(formula)
+}
+```
+
+```{r Run bas_glmFC deterministic}
+run_deterministic1 <- function(mp_name, sim_id, p = 2, bp_name) {
+  
+  obj <- BAS::bas.glmFC(
+    formula = build_formula(p),
+    family = poisson(link = "log"),
+    data = sim_list[[sim_id]],
+    betaprior = priors_on_beta [[bp_name]],
+    modelprior = mp[[mp_name]],
+    method = "deterministic",
+    laplace = FALSE, # set to true for CCH and beta-prime
+    store_less = TRUE
+  )
+  return (obj$pip)
+}
+```
+
+```{r Run bas_glmFC GibbsBVS}
+run_gibbs1 <- function(mp_name, sim_id, p = 2, bp_name) {
+
+  cat("\nsim_id: ", sim_id, "\n")
+  cat("num_p: ", p, "\n\n")
+
+  # Initial Model:
+  # NULL (default)
+  # Random Model: c(1, rbinom(n = p * lj, size = 1, prob = .5))
+  # Full Model: rep(1, (p*lj) + 1)
+  init_model <- c(1, rbinom(n = p * lj, size = 1, prob = .5))
+
+  obj <- BAS::bas.glmFC(
+    formula = build_formula(p),
+    family = poisson(link = "log"),
+    data = sim_list[[sim_id]],
+    # n.models = 10000,
+    betaprior = priors_on_beta [[bp_name]],
+    modelprior = mp[[mp_name]],
+    method = "GibbsBVS", # Requires (p-1) marginal likelihood evaluations per iteration (with p referring to the overparameterized design matrix)
+    bestmodel = init_model,
+    burnin.iterations = 2000, # 10000
+    MCMC.iterations = 20000, # 100000
+    laplace = FALSE, # set to true for CCH and beta-prime
+    renormalize = FALSE, # PIPs are the MCMC relative frequencies of inclusion
+    GROW = TRUE,
+    expand = 1.25,
+    n.models.init = 2500 # 2500, 5000, 10000
+  )
+
+  obj$pip.MCMC
+}
+```
+
+```{r Results function}
+sim_results <- function (scenarios1, m_p, b_p, parallel = FALSE, workers = 2,
+                         progress = TRUE, progress_file = NULL) {
+
+  p_vals <- unlist(num_p)
+  n_runs <- nrow(scenarios1)
+
+  if (!is.null(progress_file)) progress_file <- path.expand(progress_file)
+
+  # Auxiliary function to get the resident set size (RSS) in MB for the current R proces 
+  rss_mb <- function () {
+    as.numeric(strsplit(readLines("/proc/self/statm", n = 1L), " ")[[1L]][2L]) *
+      4096 / 1024^2
+  }
+
+  # Auxiliary function to print progress messages
+  say <- function (event, i, p, sim_id, secs = NA_real_) {
+    if (!progress) return (invisible(NULL))
+    line <- sprintf(
+      "[%s] pid %6d | %-5s %2d/%2d | p=%2d sim=%2d | rss=%6.0f MB%s\n",
+      format(Sys.time(), "%H:%M:%S"), Sys.getpid(), event, i, n_runs,
+      p, sim_id, rss_mb(),
+      if (is.na(secs)) "" else sprintf(" | took %6.1f s", secs)
+    )
+    if (is.null(progress_file)) cat(line)
+    else cat(line, file = progress_file, append = TRUE)
+  }
+
+  run_one1 <- function(i) {
+    p_i   <- scenarios1$p_val[i]
+    sim_i <- scenarios1$simulation_id[i]
+
+    say ("START", i, p_i, sim_i)
+    t0 <- Sys.time()
+
+    res <- if (metodo == "deterministic") {
+      run_deterministic1 (
+        mp_name = m_p, sim_id = sim_i, p = p_i, bp_name = b_p
+      )
+    } else if (metodo == "GibbsBVS") {
+      run_gibbs1 (
+        mp_name = m_p, sim_id = sim_i, p = p_i, bp_name = b_p
+      )
+    }
+
+    say ("DONE", i, p_i, sim_i,
+         as.numeric(difftime(Sys.time(), t0, units = "secs")))
+    res
+  }
+
+  if (parallel) {
+    # multisession, deliberately, not multicore: a fork inherits an already
+    # multi-threaded BLAS, and workers end up fighting over cores.
+    plan (multisession, workers = workers)
+    on.exit(plan (sequential), add = TRUE)
+
+    mat_all <- future_lapply (
+      X = seq_len(nrow(scenarios1)),
+      FUN = run_one1,
+      future.seed = master_seed
+    )
+
+    message ("sim_results used: ", future::nbrOfWorkers(), " workers")
+  } else {
+    mat_all <- lapply (X = seq_len(nrow(scenarios1)), FUN = run_one1)
+  }
+
+  # One matrix per p: each row a simulation repetition, each column a factor.
+  # The tiers are already in ascending p, and within a tier run_one1 returns in
+  # scenarios1 row order, so this lines up with names(out) below.
+  out <- lapply(p_vals, function(p)
+    do.call(rbind, mat_all[scenarios1$p_val == p]))
+
+  names(out) <- paste0 ("p_", p_vals)
+  return(out)
+  
+}
+```
+
+```{r Results}
+system.time({
+  results_SBSB <- sim_results(
+    scenarios1, "SBSB",
+    "robust", # robust, unit_inf_DBF, unit_inf_TBF
+    parallel = TRUE, workers = 15, progress = FALSE #, progress_file = "~/sim_progress.log"
+  )
+})
+# print(results_SBSB)
+
+system.time({
+  results_SBC <- sim_results(
+    scenarios1, "SBC",
+    "robust", # robust, unit_inf_DBF, unit_inf_TBF
+    parallel = TRUE, workers = 15, progress = FALSE #, progress_file = "~/sim_progress.log"
+  )
+})
+# print(results_SBC)
+
+system.time({
+  results_CC <- sim_results(
+    scenarios1, "CC",
+    "robust", # robust, unit_inf_DBF, unit_inf_TBF
+    parallel = TRUE, workers = 15, progress = FALSE #, progress_file = "~/sim_progress.log"
+  ) 
+})
+# print(results_CC)
+```
+
+```{r Transformations}
+pips_CC   <- results_CC   |> do.call(cbind, .)
+pips_SBC  <- results_SBC  |> do.call(cbind, .)
+pips_SBSB <- results_SBSB |> do.call(cbind, .)
+
+pips_all <- rbind(pips_CC, pips_SBC, pips_SBSB) |>
+  as.data.frame() |>
+  setNames(paste0("pip(", colnames(.), ")")) |>
+  as.matrix() |>
+  round(digits = 2)
+# print(pips_all)
+```
+
+Others User Warning: change *path* variable! 
+```{r Saving PIPs}
+if (machine == "server") {
+  path <- "/home/dbaptista/Exp1_results/"
+} else if (machine == "local") {
+  path <- "C:/Users/david/Downloads/"
+}
+
+if (metodo == "GibbsBVS") {
+  excel_file <- paste0(path, "pips_gibbs.xlsx")
+} else if (metodo == "deterministic") {
+  excel_file <- paste0(path, "pips_deterministic.xlsx")
+}
+
+library(openxlsx)
+saving_pips <- function(pips, num_p, file) {
+
+  if (file.exists(file)) {
+    wb <- loadWorkbook(file)
+  } else {
+    wb <- createWorkbook()
+  }
+
+  sheet_name <- paste0("l", lj)
+  if (sheet_name %in% names(wb)) {
+    removeWorksheet(wb, sheet_name)
+  }
+  addWorksheet(wb, sheet_name)
+
+  # if (!(sheet_name %in% names(wb))) {
+  #   addWorksheet(wb, sheet_name)
+  # }
+
+  # To create a Blank Worksheet (if needed)
+  # removeWorksheet(wb, sheet_name)
+  # addWorksheet(wb, sheet_name)
+
+  p_vals <- unlist (num_p)
+
+  begin <- 1
+  for (i in seq_along (p_vals)) {
+
+    end <- begin + p_vals[i] - 1
+    aux_mat_i <- pips [, begin:end]
+
+    pips_int <- cbind ( 
+      aux_mat_i [1:num_iter,],                 # CC
+      aux_mat_i [(num_iter+1):(2*num_iter),],  # SBC
+      aux_mat_i [(2*num_iter+1):(3*num_iter),] # SBSB
+    ) # 10 x (p_v)als[i]*3) Matrix
+
+    headers <- rep (c("CC", "SBC", "SBSB"), each = p_vals[i])
+    pips_out <- rbind (headers, pips_int) # 11 rows + colnames
+    colnames (pips_out) <- colnames (pips_int)
+    
+    writeData(
+      wb, sheet_name,
+      pips_out,
+      startRow = 1 + ((12 + 2)*(i-1)), # +2 for spacing
+      startCol = 1,
+      rowNames = FALSE,
+      colNames = TRUE
+    )
+
+    begin <- end + 1
+
+  }
+
+  saveWorkbook (wb, excel_file, overwrite = TRUE)
+
+}
+saving_pips(pips_all, num_p, excel_file)
+```
+
+```{r Auxiliary Functions}
+signals <- function(mat) {
+  # 1st two columns of the matrix = Two active factors
+  mat <- mat[, 1:2]
+}
+
+spurious <- function(mat) {
+  # Rest of the columns of the matrix 
+  mat <- mat [, -(1:2), drop = FALSE]
+}
+```
+
+## Analysis of results and plots
+```{r Number of signals corresponding to spurious factors}
+# If it increases with p, then it means that the model space prior is not controlling for multiplicity. 
+wrong_signals <- function(num_p, results, m_p, file = NULL) {
+  
+  p_vals <- unlist(num_p)
+
+  line <- paste0("\n\nNumber of signals corresponding to spurious factors (l=",lj,")\n")
+  line <- paste0(line, m_p, ":\n")
+  
+    for (i in seq_along(p_vals)) {
+      
+      wrong <- results[[i]] |> 
+        spurious() |> 
+        (\(x) sum(x > 0.5)) # Across all datasets
+  
+      line <- paste0(line, "p=", p_vals[i], ": ", wrong, ";  ")
+    }
+  
+  line <- paste0(line, "\n")
+  cat(line) # Printing
+
+  if (!is.null(file)) {
+    cat(line, file = file, append = TRUE)
+  }
+
+}
+
+if (metodo == "GibbsBVS") {
+  txt_file <- paste0(path, "wrong_signals_gibbs.txt")
+} else if (metodo == "deterministic") {
+  txt_file <- paste0(path, "wrong_signals_deterministic.txt")
+}
+
+wrong_signals(num_p, results_CC, "CC", txt_file)
+wrong_signals(num_p, results_SBC, "SBC", txt_file)
+wrong_signals(num_p, results_SBSB, "SBSB", txt_file)
+```
+
+```{r Custom function plot}
+custom_plot <- function (title, num_p, results) {
+  
+  p_vals <- unlist (num_p)
+  n <- length (p_vals)
+  
+  plot (
+    seq_len(n), # x-axis positions to be labelled next
+    rep (NA, n), # y-values (NA for now, points added later)
+    ylim = c(0, 1), # y-axis limits (0 to 1, with a reference line at 0.5)
+    type = "n", # "n" = just set up axes (no points drawn yet)
+    xlab = "",                  
+    xaxt = "n", # "don´t" draw x-axis yet
+    ylab = "PIPs",     
+    main = title 
+  )
+  
+  axis (
+    side = 1, # x-axis
+    at = seq_len(n), # positions 
+    labels = paste0("p = ", p_vals)
+  )
+  
+  # Horizontal reference line at y = 0.5 
+  abline (h = .5, col = gray (0.6))
+  
+  for (i in seq_along (p_vals)) {
+    
+    mat  <- results [[paste0 ("p_", p_vals[i])]]
+    sig  <- signals (mat)
+    spur <- spurious (mat)
+    
+    # Signals 
+    points (
+      rep(i, # Position i (in the x-axis)
+          length(sig)),
+      sig, # y-values
+      col = 3 # Green
+    )
+
+    # Spurious Factors
+    points (
+      rep(i, length(spur)),
+      spur,
+      col = 2 # Red
+    )
+    
+  }
+  
+}
+```
+
+```{r Plotting}
+# par (mfrow = c(1, 3))
+# custom_plot ("Const-Const", num_p, results_CC)
+# custom_plot ("SB-Const", num_p, results_SBC)
+# custom_plot ("SB-SB", num_p, results_SBSB)
+```
+
+```{r .pdf files with the graphs}
+suffix <- if (metodo == "GibbsBVS") "_gibbs" else "_deterministic"
+
+graphs <- list(
+  CC   = list(title = "Const-Const", results = results_CC),
+  SBC  = list(title = "SB-Const",    results = results_SBC),
+  SBSB = list(title = "SB-SB",       results = results_SBSB)
+)
+
+for (mp_name in names(graphs)) {
+
+  pdf_file <- paste0(path, "graphs_l", lj, suffix, "_", mp_name, ".pdf")
+
+  pdf(pdf_file, width = 4, height = 7) # vector graphics: sharp at any print size in LaTeX
+  custom_plot(graphs[[mp_name]]$title, num_p, graphs[[mp_name]]$results)
+  dev.off()
+
+}
+```
+
+```{r Run Above}
+```
+

@@ -1,0 +1,477 @@
+---
+title: "VSFactors - 2nd Simul"
+author: "David Baptista"
+output: html_document
+---
+
+WARNING: computations were made using a HAL server. Local machine is only useful if smaller experiments are made or for your personal use
+```{r Package Load/Install}
+# -----------------------------------------
+# Local Machine (directly from GitHub)
+# -----------------------------------------
+#remove.packages ("BAS", source = "CRAN")
+#devtools::install_github (
+#  "davidembb20/BAS",
+#  ref = "costs_and_factors",
+#  force = TRUE
+#)
+# -----------------------------------------
+# HAL server
+# -----------------------------------------
+# e.g., download the package from GitHub (https://github.com/davidembb20/BAS/tree/costs_and_factors)
+# to your local machine and then to the server, and set that folder as wd
+#install.packages (".", repos = NULL, type = "source")
+# -----------------------------------------
+
+Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1") # Faster parallel computing
+# to use with multisession, deliberately (not multicore), so that workers don´t end up fighting over cores.
+library (BAS)
+```
+
+# 2nd Experiment: VSFactors
+The effect on the posterior inclusion probabilities (PIP) of increasing the number of levels within factors.
+```{r Options}
+metodo <- "GibbsBVS" # GibbsBVS, deterministic
+machine <- "server" # server, local
+master_seed <- 1234
+n_workers <- 20
+
+num_iter <- 10 # Number of replicates for each scenario
+num_factors <- 4
+n  <- 300 # Sample size
+n1 <- 30  # No. of obs assigned to the 1st level of the active factor
+alpha <- 1 # Intercept
+beta11_vec <- c(0.7, 0.55) # Other values can also be tested
+
+levs <- list(
+  l5 = 5,
+  l15 = 15
+)
+
+mp2 <- list(
+  SBC = BAS:::SBC(),
+  SBSB = BAS:::SBSB()
+)
+
+# Cartesian Product (df)
+scenarios2 <- expand.grid(
+  lev_name = names(levs),
+  beta_id  = seq_along(beta11_vec),
+  iter = seq_len(num_iter)
+)
+```
+
+```{r Priors on Model Parameters}
+priors_on_beta <- list(
+  robust       = BAS::robust(n = n)#,
+  #intrinsic    = BAS::intrinsic(n = n),
+  #beta_prime   = BAS::beta.prime(n = n),
+  #CH_a05_bn    = BAS::CCH(alpha = 1/2, beta = n),
+  #CH_a1_bn     = BAS::CCH(alpha = 1, beta = n),
+  #CH_a05_b05n  = BAS::CCH(alpha = 1/2, beta = n/2),
+  #CH_a1_b05n   = BAS::CCH(alpha = 1, beta = n/2),
+  # unit_inf_DBF = BAS::g.prior(g = n), # Unit information Prior (data-based Bayes Factors)
+  # unit_inf_TBF = BAS::testBF.prior(g = n), # Unit information Prior (test-based Bayes Factors)
+  #ZS_adapted   = BAS::CCH(alpha = 1, beta = 2, s = n + 3),
+  #benchmark    = BAS::CCH(alpha = 0.02, beta = 0.02 * max(n, p^2)), # need to define p before this if used; with the recommended c = 0.01;
+  #hyper_gn     = BAS::hyper.g.n(alpha = 3), # special case of the robust prior...
+  #BIC          = BAS::bic.prior(n), # favors small models
+	#AIC          = BAS::aic.prior(), # favours large models
+  #local_eb     = BAS::EB.local(), # tends to favor large models
+)
+```
+
+```{r Simulated Data Parallel}
+library(future.apply)
+library(dplyr)
+
+generate_data <- function (scenarios = scenarios2) {
+
+  future_lapply(
+  seq_len(nrow(scenarios)),
+  function(i) {
+
+    lev_name <- as.character (scenarios$lev_name[i])
+    l <- levs[[lev_name]]
+
+    j <- scenarios$beta_id[i]
+    beta11 <- beta11_vec[j]
+  
+    factors <- vector("list", num_factors)
+
+    if (l == 2) {
+      factors[[1]] <- c(rep(1, n1), rep (2, n - n1))
+    } else {
+      factors[[1]] <- c(rep(1, n1), sample(2:l, n - n1, replace = TRUE))
+    }
+    if (num_factors > 1) {
+      for (j in 2:num_factors) {
+        factors[[j]] <- sample(1:l, n, replace = TRUE)
+      }
+    }
+    
+    # Design matrix 
+    X <- do.call(cbind, factors)
+    # Overparameterized design matriz
+    X_over <- matrix(0, nrow = n, ncol = num_factors * l);
+    # One-hot encoding
+    for (k in seq_len(ncol(X))) {
+      X_over[cbind(1:n, (k - 1) * l + X[, k])] <- 1
+    }
+    
+    beta  <- c(
+      beta11, rep (0, l - 1),  # 1st Factor (only the 1st level is active)
+      rep (0, (ncol(X)-1) * l) # Spurious Factors
+    )    
+
+    eta <- alpha + X_over %*% beta # Linear predictor
+    y <- rpois(n, lambda = exp (eta))
+
+    sim_data <- as.data.frame(X) |>
+      setNames(paste0("F", seq_len(ncol(X)))) |> # colNames
+      dplyr::mutate(dplyr :: across(
+        everything(),
+        ~ relevel(factor(.x, levels = seq_len(l)), ref = "2")
+        # as.factor
+      )) |>
+      dplyr::mutate(y = y, .before = 1) # 1st column: y
+    
+  },
+  future.seed = TRUE
+  )
+
+}
+```
+
+```{r Build Formula Function}
+build_formula <- function (p) {
+  vars <- paste0("F", seq_len(p))
+  formula <- as.formula(
+    paste("y ~", paste(vars, collapse = " + "))
+  )
+  return(formula)
+}
+```
+
+```{r Run bas_glmFC deterministic}
+run_deterministic2 <- function(prior_name, data_i, beta_name) {
+  
+  obj <- BAS::bas.glmFC(
+    formula = build_formula(num_factors),
+    family = poisson(link = "log"),
+    data = data_i,
+    betaprior = priors_on_beta [[beta_name]],
+    modelprior = mp2[[prior_name]],
+    method = "deterministic",
+    laplace = FALSE, # set to true for CCH and beta-prime 
+    store_less = TRUE # TRUE, FALSE
+  )
+  return(obj$pip)
+}
+```
+
+```{r Run bas_glmFC GibbsBVS}
+run_gibbs2 <- function(prior_name, data_i, lev_name, beta_name) {
+
+  l <- levs[[lev_name]]
+
+  # Initial Model: NULL (default), Random Model: c(1,rbinom(n = (num_factors*l), size = 1, prob = .5)), Full Model: rep(1, (num_factors*l) + 1)
+  init_model <- c(1, rbinom(n = (num_factors * l), size = 1, prob = .5))
+
+  obj <- BAS::bas.glmFC(
+    formula = build_formula(num_factors),
+    family = poisson(link = "log"),
+    data = data_i,
+    betaprior = priors_on_beta [[beta_name]],
+    modelprior = mp2[[prior_name]],
+    method = "GibbsBVS",
+    bestmodel = init_model,
+    burnin.iterations = 5000, 
+    MCMC.iterations = 50000, 
+    laplace = FALSE, # set to true for CCH and beta-prime
+    renormalize = FALSE, # PIPs are the MCMC relative frequencies of inclusion
+    GROW = TRUE,
+    expand = 1.25,
+    n.models.init = 5000 # 10000
+  )
+  return(obj$pip.MCMC)
+}
+```
+
+```{r Results function}
+library(future.apply)
+
+sim_results2 <- function (scenarios, m_p, b_p, parallel = TRUE, workers = NULL) {
+
+  # 'scenarios' now carries the replicate index (iter), so each row is one
+  # independent run: all (lev_name, beta_id, iter) runs go out in a single batch
+
+  # A single plan for the whole call, instead of starting and tearing down one
+  # worker pool per stage (data generation) and per replicate
+  if (parallel) {
+    if (is.null(workers)) {
+      workers <- min (nrow(scenarios), n_workers, parallelly::availableCores())
+    }
+    # multisession, deliberately, not multicore: a fork inherits an already
+    # multi-threaded BLAS, and workers end up fighting over cores.
+    plan (multisession, workers = workers)
+    on.exit(plan (sequential), add = TRUE)
+    message ("sim_results2 using ", future::nbrOfWorkers(), " workers for ",
+             nrow(scenarios), " runs")
+  } else {
+    plan (sequential)
+  }
+
+  set.seed (master_seed)
+  
+  SIMUL_data <- generate_data (scenarios)
+
+  run_one <- function (i) {
+    if (metodo == "deterministic") {
+      return (
+        run_deterministic2 (
+          prior_name = m_p,
+          data_i = SIMUL_data[[i]], # dataset corresponding to scenarios i-th row
+          beta_name = b_p
+        )
+      )
+    } else if (metodo == "GibbsBVS") {
+      return (
+        run_gibbs2 (
+          prior_name = m_p,
+          data_i = SIMUL_data[[i]], # dataset corresponding to scenarios i-th row
+          lev_name = as.character (scenarios$lev_name[i]),
+          beta_name = b_p
+        )
+      )
+    }
+  }
+
+  mat_list <- future_lapply (
+    X = seq_len(nrow(scenarios)),
+    FUN = run_one,
+    future.seed = TRUE
+  )
+
+  mat.pip <- mat_list %>%
+    do.call (rbind, .) %>%  # Converting into a matrix
+    round(2)
+
+  colnames (mat.pip) <- paste0("F", seq_len(ncol(mat.pip)))
+    
+  return(mat.pip)
+  
+}
+```
+
+```{r Aggregate Function}
+agg_results <- function (m_p, b_p = "robust", parallel = TRUE, workers = NULL) {
+
+  # No loop over replicates: they are rows of scenarios2 now, so the whole grid
+  # is fitted in one parallel batch
+  message ("--- ", m_p, ": ", nrow(scenarios2), " runs (",
+           length(unique(scenarios2$iter)), " replicates) ---")
+
+  mat.pip <- sim_results2 (
+    scenarios2,
+    m_p,
+    b_p,
+    parallel = parallel, workers = workers
+  ) # dim: (nrow(scenarios2) x num_factors)
+
+  # A "scenario" is everything except the replicate index; the reduction below
+  # runs over iter, so these are the rows that survive into the output
+  base_cols <- setdiff (names(scenarios2), "iter")
+  scen_base <- unique (scenarios2[base_cols])
+  rownames (scen_base) <- NULL
+
+  # Row of scenarios2 (and hence of mat.pip) -> row of scen_base
+  grp <- match (
+    do.call (paste, c(scenarios2[base_cols], sep = "\r")),
+    do.call (paste, c(scen_base[base_cols], sep = "\r"))
+  )
+
+  iters  <- sort (unique(scenarios2$iter))
+  n_scen <- nrow (scen_base)
+  p      <- ncol (mat.pip)
+
+  # Stack the replicates along a 3rd margin, as before:
+  # arr has dim (n_scen x num_factors x num_iter)
+  arr <- array (
+    NA_real_,
+    dim = c(n_scen, p, length(iters)),
+    dimnames = list (NULL, colnames(mat.pip), paste0("iter", iters))
+  )
+  for (s in seq_len(n_scen)) {
+    rows <- which (grp == s)                          # one row per replicate
+    rows <- rows[order (scenarios2$iter[rows])]       # ordered by iter
+    arr[s, , ] <- t (mat.pip[rows, , drop = FALSE])
+  }
+
+  # apply over margins c(1, 2) => the reduction runs over the replicates only,
+  # entry by entry, so the result keeps the (n_scen x num_factors) shape
+  mat_pip <- apply (arr, c(1, 2), mean)                    # spurious factors
+  # mat_pip[, 1] <- apply (arr[, 1, , drop = FALSE], 1, min) # active factor
+  # drop = FALSE keeps arr[, 1, ] as an array when num_iter == 1
+  colnames (mat_pip) <- paste0("F", seq_len(ncol(mat_pip)))
+  # scen_base drops the iter column, so the output keeps the same shape and
+  # columns as before (one row per lev_name x beta_id combination)
+  mat_pip <- cbind (as.data.frame(mat_pip), scen_base)
+  mat_pip$m_p <- m_p
+  # Raw replicates kept for diagnostics: a list of length num_iter, each element
+  # a matrix of size (n_scen x num_factors)
+  attr(mat_pip, "replicates") <- lapply (seq_along(iters), function (j) {
+    matrix (
+      arr[, , j], nrow = n_scen, ncol = p,
+      dimnames = list (NULL, colnames(mat_pip)[seq_len(p)])
+    )
+  })
+  return (mat_pip)
+
+}
+```
+
+```{r Aggregate Results}
+system.time({
+  exp2_SBC <- agg_results ("SBC", "robust", # robust, unit_inf_DBF, unit_inf_TBF
+                           parallel = TRUE, workers  = n_workers)
+})
+print(exp2_SBC)
+# reps_SBC <- attr(exp2_SBC, "replicates")
+# reps_SBC[[1]]          # first replicate: n_scen x num_factors matrix
+# length(reps_SBC)       # == num_iter
+
+system.time({
+  exp2_SBSB <- agg_results ("SBSB", "robust", parallel = TRUE, workers = n_workers)
+})
+print(exp2_SBSB)
+# reps_SBSB <- attr(exp2_SBSB, "replicates")
+# reps_SBSB[[1]]          # first replicate: n_scen x num_factors matrix
+# length(reps_SBSB)       # == num_iter
+
+exp2 <- rbind(exp2_SBC, exp2_SBSB)
+print(exp2)
+```
+
+## Analysis of results and plots
+```{r df Transformations}
+library(dplyr)
+library(tidyr)
+
+exp2_wide <- exp2 %>% # Size df: (nrow (exp) x 7)
+  pivot_longer( # Stacking F1–F4 into 2 columns (names and values)
+    cols = starts_with("F"),
+    names_to = "Factor",
+    values_to = "PIP"
+  ) %>% # Size df: ((nrow(exp) * 4) x 5)
+  unite(
+    col = "model_lev", # New column name
+    m_p, lev_name,
+    sep = "_" # for combining the values of these 2 columns
+  ) %>% # Size df: ((nrow(exp) * 4) x 4)
+  pivot_wider ( # model_lev and PIP columns are dropped
+    names_from = model_lev, # New column names
+    values_from = PIP
+  ) %>% # Size df: ((lenghth(beta11_vec) * 4) x (2 + (length(mp2)*length(levs)))
+  dplyr :: select (# Ordering columns
+    beta_id, Factor,
+    starts_with("SBSB"),
+    starts_with("SBC")) %>% 
+  as.data.frame()
+```
+
+```{r Table Function, results='asis', echo=FALSE}
+LaTex_table <- function (df, id) {
+  
+  df <- df %>% 
+    dplyr :: filter (beta_id == id) %>% # subsetting the df 
+    dplyr :: select (-c(beta_id, Factor))
+  
+  rownames (df) <- paste0("pip(F", seq_len(nrow(df)), "):")
+  
+  # keep only lx...ly
+  colnames(df) <- sub("^[^_]+_", "", colnames(df))
+  # l=x...l=y
+  colnames(df) <- sub("^l([0-9]+)$", "l=\\1", colnames(df))
+
+  header1 <- c (rep("SBSB", (ncol(df)/2)), rep("SBC", (ncol(df)/2)))
+  
+  out_df <- rbind (header1, colnames(df), df)
+  rownames(out_df) <- c("Model Prior","Number levels", rownames(df))
+  colnames(out_df) <- c(rep("",ncol(out_df)))
+
+  return(out_df)
+
+}
+```
+
+```{r Print Tables}
+for (i in seq_along(beta11_vec)) {
+
+  title <- paste0("β_{11} = ", beta11_vec[i])
+  cat(title, "\n")
+  
+  out_df <- LaTex_table (exp2_wide, i)
+  print (out_df, digits = 2)
+  cat("\n")
+
+}  
+```
+
+Others User Warning: change *path* variable! 
+```{r Sending to .xlsx Files}
+if (machine == "server") {
+  path <-  "/home/dbaptista/"
+} else if (machine == "local") {
+  path <- "C:/Users/david/Downloads/"
+}
+
+if (metodo == "GibbsBVS") {
+  outfile <- paste0(path,"Exp2_results_gibbs.xlsx") 
+} else if (metodo == "deterministic") {
+  outfile <- paste0(path,"Exp2_results_deterministic.xlsx")
+}
+
+library (openxlsx)
+
+if (file.exists(outfile)) {
+  wb <- loadWorkbook(outfile)
+} else {
+  wb <- createWorkbook()
+}
+
+sheet <- paste0(num_factors, "_factors")
+if (!(sheet %in% names(wb))) {
+  addWorksheet(wb, sheet)
+}
+
+# To create a Blank Worksheet (if needed)
+# removeWorksheet(wb, sheet)
+# addWorksheet(wb, sheet)
+
+start_row <- 1
+for (i in seq_along(beta11_vec)) {
+
+  title <- paste0("β_{11} = ", beta11_vec[i])
+  writeData(wb, sheet, title, startRow = start_row, startCol = 1)
+
+  tabela <- LaTex_table (exp2_wide, i)
+  writeData(
+    wb, sheet,
+    tabela,
+    startRow = start_row + 1, # +1 to write the table below the title
+    startCol = 1,
+    rowNames = TRUE,
+    colNames = FALSE
+  )
+
+  start_row <- start_row + (1 + nrow(tabela)) + 1 # title and tabela rows + 1 for spacing between tables
+  # print (start_row) # Next iteration beginning row
+
+}
+
+saveWorkbook (wb, outfile, overwrite = TRUE)
+```
+
+```{r Run Above}
+```

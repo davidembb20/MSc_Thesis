@@ -1,0 +1,13 @@
+age,1.00,1.00,Yes,None
+sex,1.00,1.00,Yes,None
+cp,1.00,1.00,Yes,None
+trestbps,1.00,1.00,Yes,None
+chol,7.27,5.17,No,A
+fbs,5.20,3.10,No,A
+restecg,15.50,15.50,No,None
+thalach,102.90,1.00,No,B
+exang,87.30,1.00,No,C
+oldpeak,87.30,1.00,No,C
+slope,87.30,1.00,No,C
+ca,100.90,100.90,No,None
+thal,102.90,1.00,No,B

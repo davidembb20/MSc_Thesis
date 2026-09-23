@@ -1,0 +1,699 @@
+---
+title: "heart_disease"
+author: "David Baptista"
+date: "2025-07-10"
+output: html_document
+---
+
+WARNING: computations were made using a HAL server. Local machine is only useful if smaller experiments are made or for your personal use
+```{r Loading the Package}
+# -----------------------------------------
+# Local Machine (directly from GitHub)
+# -----------------------------------------
+#remove.packages ("BAS", source = "CRAN")
+#devtools::install_github (
+#  "davidembb20/BAS",
+#  ref = "costs_and_factors",
+#  force = TRUE
+#)
+# -----------------------------------------
+# HAL server
+# -----------------------------------------
+# e.g., download the package from GitHub to your local machine and then to the server, and set that folder as wd
+#install.packages (".", repos = NULL, type = "source")
+# -----------------------------------------
+
+Sys.setenv(OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1") # Faster parallel computing
+# to use with multisession, deliberately (not multicore), so that workers don´t end up fighting over cores.
+library (BAS)
+```
+
+# Heart Disease Dataset
+. -------------------------------------
+. Competing Variables:
+. -------------------------------------
+. **Numeric** 
+. age: age in years
+. chol: serum cholestoral in mg/dl
+. trestbps: resting blood pressure (in mm Hg on admission to the hospital)
+. thalach: maximum heart rate achieved
+. oldpeak : ST depression induced by exercise relative to rest
+. **Categorical**
+. sex: sex (1 = male; 0 = female)
+. cp: chest pain type    
+. fbs: (fasting blood sugar > 120 mg/dl)  (1 = true; 0 = false)
+. restecg: resting electrocardiographic results
+. exang: exercise induced angina (1 = yes; 0 = no)
+. slope: the slope of the peak exercise ST segment
+. ca: number of major vessels (0-3) colored by flourosopy
+. thal: type of heart defect
+. -------------------------------------
+. Dependent Variable
+. -------------------------------------
+. target: diagnosis of heart disease (angiographic disease status)
+
+Others Users Warning: change wd to read the datasets and after that to use the BAS package
+```{r Loading the data dataset}
+machine <- "server" # server, local
+master_seed <- 1234
+
+# getwd()
+if (machine == "server") {
+  setwd("/home/dbaptista")
+} else if (machine == "local") {
+  setwd("C:/Users/david/Downloads")
+}
+
+column_names <- c(
+  "age", "sex", "cp", "trestbps", "chol", "fbs", "restecg",
+  "thalach", "exang", "oldpeak", "slope", "ca", "thal", "target"
+)
+
+library(dplyr)
+cleveland_heart <- read.table(
+  "processed.cleveland.data",
+  header = FALSE,
+  col.names = column_names,
+  sep = ",",
+  na.strings  = "?") |> # Removing NA´s
+  tidyr :: drop_na() |>
+  mutate( # Converting variables into factors
+    dplyr :: across(
+      c(sex, cp, fbs, restecg, exang, slope, ca, thal, target),
+      as.factor
+    ),
+    # y (target) = presence of heart disease in each patient
+    target = factor(if_else(target == "0", "No", "Yes"))
+  )
+
+# Num of col of the corresponding overparameterized design matrix
+p_over <- cleveland_heart |> 
+  dplyr::select(-target) |> # Design Matrix
+  dplyr::summarise(
+    dplyr::across(
+      dplyr::everything(),
+      ~ if (is.factor(.x)) nlevels(.x) else 1L
+    )) |>
+  unlist() |>
+  sum()
+# print(p_over) # Unfeasible to enumerate
+```
+
+```{r Loading the costs dataset}
+custos <- read.table(
+  "all_costs_info",
+  header = FALSE,
+  sep = ",",
+  col.names = c(
+    "Variables", "Marginal Cost",
+    "Discounted Cost", "Immediate", "Group"
+  )) |>
+  dplyr :: select(-4) |> # Remove Immediate column
+  dplyr :: mutate(
+    Group = recode(Group,
+      "None" = 0,
+      "A" = 1,
+      "B" = 2,
+      "C" = 3
+    ))
+
+if (machine == "server")
+  setwd("/home/dbaptista/BAS")
+```
+
+```{r Building the mat (var.costs), basglm argument}
+costs_mat <- matrix (1, nrow = nrow (custos), ncol = nrow (custos) + 1)
+rownames (costs_mat) <- as.character (custos [, 1])
+colnames (costs_mat) <- c ("Groups", rownames (costs_mat))
+
+# Variables Groups...
+costs_mat [, 1] <- as.numeric (custos [, 4])
+
+# Marginal Costs
+for (i in seq_len (nrow (costs_mat)))
+  costs_mat [, i + 1] <- as.numeric (custos [i, 2]) 
+
+old_costs_mat <- costs_mat
+old_costs_mat [, 1] <- 0 # No costs structures
+
+# Discounted Costs (single group)
+costs_mat ["chol", "fbs"] <- 5.17
+costs_mat ["fbs", "chol"] <- 3.10
+# Grouped Predictors (2 groups)
+costs_mat ["thal", "thalach"]  <- 1.0
+costs_mat ["thalach", "thal"]  <- 1.0
+#
+costs_mat ["exang", "oldpeak"] <- 1.0
+costs_mat ["exang", "slope"]   <- 1.0
+costs_mat ["oldpeak", "exang"] <- 1.0
+costs_mat ["oldpeak", "slope"] <- 1.0
+costs_mat ["slope", "exang"]   <- 1.0
+costs_mat ["slope", "oldpeak"] <- 1.0
+
+# print(costs_mat) # colSums must be equal for (columns) elements of the same group, after we subset the columns and rows for each group
+```
+
+```{r Options}
+base_mat <- matrix (1, nrow = nrow (custos), ncol = nrow (custos) + 1)
+base_mat [, 1] <- 0
+rownames (base_mat) <- as.character (custos [, 1])
+colnames (base_mat) <- c ("Groups", rownames (costs_mat))
+
+costs_list <- list(
+  no_costs = base_mat,
+  no_discount = old_costs_mat, 
+  discounted = costs_mat
+)
+
+bp_heart <- list(
+  unit_info = BAS::g.prior(g = nrow(cleveland_heart)) 
+)
+b_grid <- as.double(seq (from = 0, to = 0.6, by = 0.03))
+```
+
+```{r Column Names BAS and positions matrix}
+library(AUC)
+
+run_one_heart <- function(mp_name, bp_name, b_grid, costs_name = NULL, i) {
+
+  if (mp_name == "FND_Const") {
+    mp <- BAS:::FNDConst(b = b_grid[i])
+  } else if (mp_name == "FND_SB") {
+    mp <- BAS:::FNDSB(b = b_grid[i])
+  }   
+
+  # Initial Model:
+  # Null Model: NULL
+  # Random Model: c(1,rbinom(n = p_over, size = 1, prob = .5))
+  # Full Model: rep(1, p_over + 1)
+  init_model <- c(1, rbinom(n = p_over, size = 1, prob = .5))
+
+  # system.time(
+  obj <- BAS::bas.glmFC(
+    formula = target ~ .,
+    family = binomial(link = "logit"),
+    data = cleveland_heart,
+    betaprior = bp_heart[[bp_name]],
+    modelprior = mp,
+    var.costs = costs_list[[costs_name]],
+    method = "GibbsBVS",
+    bestmodel = init_model,
+    burnin.iterations = 10000, # 10000
+    MCMC.iterations = 100000, # 100000
+    laplace = FALSE, # set to true for CCH and beta-prime
+    renormalize = FALSE, # PIPs = MCMC relative frequencies of inclusion
+    GROW = TRUE,
+    expand = 1.25,
+    n.models.init = 5000 # 10000
+  )
+  #)
+  
+  cat("b value: ", b_grid[i], "\n")
+
+  # HPM
+  # cat("HPM:", obj$HPM_short, "\n")  
+  cat("Cost HPM:", obj$HPM_cost, "\n") 
+  len_HPM <- length(obj$HPM_extended) # - 1 (no need I think...)
+  cat("Length MPM:", len_HPM, "\n") 
+  # In-Sample Predictions: newdata = cleveland_heart or NULL
+  test_HPM = BAS:::predict.basglm (obj, newdata = NULL, type = "response",  estimator = "HPM")$fit;
+  auc_hpm = auc(roc(test_HPM, cleveland_heart$target)); # AUC
+  # cat("AUC HPM:", auc_hpm, "\n") 
+
+  # MPM
+  # cat("MPM:", obj$MPM_short, "\n") # Binary Indicator (competing variables): check also _extended
+ 
+  cat("Cost MPM_dummy:", obj$MPM_extended_cost, "\n")  
+  len_MPM_dummy <- sum(obj$MPM_extended > 0) - 1
+  cat("Length MPM_dummy:", len_MPM_dummy, "\n") 
+
+  len_MPM_grouped <- sum(obj$MPM_grouped > 0) - 1
+  cat("Length MPM_grouped:", len_MPM_grouped, "\n") 
+   cat("Cost MPM_grouped:", obj$MPM_grouped_cost, "\n")  
+
+  # print ("MPM extended\n")
+  # print(obj$MPM_extended)
+
+  bas_MPM_dummy <- BAS::bas.glmFC(
+    formula = target ~ .,
+    family = binomial(link = "logit"),
+    data = cleveland_heart,
+    betaprior = bp_heart[[bp_name]],
+    modelprior = mp,
+    method = "GibbsBVS",
+    bestmodel = obj$MPM_extended,
+    burnin.iterations = 0, # 10000
+    MCMC.iterations = 0, # 100000
+    renormalize = FALSE, # PIPs = MCMC relative frequencies of inclusion
+    GROW = TRUE,
+    expand = 1,
+    n.models.init = 1 
+  )
+  test_MPM_dummy = BAS:::predict.basglm (bas_MPM_dummy, newdata = NULL, type = "response",  estimator = "HPM")$fit;
+  auc_mpm_dummy = auc(roc(test_MPM_dummy, cleveland_heart$target)); # AUC
+  # cat("AUC MPM_dummy:", auc_mpm_dummy, "\n") 
+
+  bas_MPM_grouped <- BAS::bas.glmFC(
+    formula = target ~ .,
+    family = binomial(link = "logit"),
+    data = cleveland_heart,
+    betaprior = bp_heart[[bp_name]],
+    modelprior = mp,
+    method = "GibbsBVS",
+    bestmodel = obj$MPM_grouped,
+    burnin.iterations = 0, # 10000
+    MCMC.iterations = 0, # 100000
+    renormalize = FALSE, # PIPs = MCMC relative frequencies of inclusion
+    GROW = TRUE,
+    expand = 1,
+    n.models.init = 1 
+  )
+  test_MPM_grouped = BAS:::predict.basglm (bas_MPM_grouped, newdata = NULL, type = "response",  estimator = "HPM")$fit;
+  auc_mpm_grouped = auc(roc(test_MPM_grouped, cleveland_heart$target)); # AUC
+  # cat("AUC MPM_grouped:", auc_mpm_grouped, "\n") 
+
+  send <- list (
+    PIPs = obj$pip.MCMC,
+    HPM_Cstat = auc_hpm,
+    MPM_dummy_Cstat = auc_mpm_dummy,
+    MPM_grouped_Cstat = auc_mpm_grouped,
+    HPM_cost = obj$HPM_cost,
+    MPM_dummy_cost = obj$MPM_extended_cost,
+    MPM_grouped_cost = obj$MPM_grouped_cost
+  )
+
+}
+```
+
+## Table Object for LaTeX
+```{r Cost table PDF}
+predictor_labels <- c(
+  age      = "age",
+  sex      = "sex",
+  cp       = "chest pain",
+  trestbps = "resting BP",
+  chol     = "cholesterol",
+  fbs      = "blood sugar",
+  restecg  = "EKG",
+  thalach  = "heart rate",
+  exang    = "exercise angina",
+  oldpeak  = "ST depression",
+  slope    = "peak ST segment",
+  ca       = "major vessels",
+  thal     = "defect type"
+)
+
+cost_table <- read.table(
+  "all_costs_info",
+  header = FALSE,
+  sep = ",",
+  col.names = c(
+    "Variables", "Marginal.Cost",
+    "Discounted.Cost", "Immediate", "Group"
+  )
+) |>
+  dplyr::mutate(
+    Label = predictor_labels[Variables],
+    Discounted.Cost = ifelse(
+      Group == "None", "--", sprintf("%.2f", Discounted.Cost)
+    ),
+    Marginal.Cost = sprintf("%.2f", Marginal.Cost),
+    Group = ifelse(Group == "None", "--", Group)
+  ) |>
+  dplyr::select(Label, Marginal.Cost, Discounted.Cost, Group)
+
+escape_tex <- function(x) gsub("&", "\\\\&", x)
+
+tex_rows <- paste(
+  apply(cost_table, 1, function(r) {
+    paste(escape_tex(r["Label"]), r["Marginal.Cost"],
+          r["Discounted.Cost"], r["Group"], sep = " & ")
+  }),
+  "\\\\"
+)
+
+tex_body <- paste(tex_rows, collapse = "\n")
+
+tex_doc <- sprintf('
+\\documentclass[11pt]{article}
+\\usepackage[margin=1in]{geometry}
+\\usepackage{booktabs}
+\\usepackage{xcolor}
+\\usepackage{array}
+\\pagestyle{empty}
+
+\\begin{document}
+\\begin{table}[htbp]
+\\centering
+\\renewcommand{\\arraystretch}{1.3}
+\\rowcolors{2}{gray!8}{white}
+\\begin{tabular}{l r r c}
+\\toprule
+\\textbf{Variable} & \\textbf{Marginal Cost} & \\textbf{Discounted Cost} & \\textbf{Group} \\\\
+\\midrule
+%s
+\\bottomrule
+\\end{tabular}
+\\caption{Marginal and discounted acquisition costs by predictor. Variables with no group discount are marked with \\textendash{}.}
+\\end{table}
+\\end{document}
+', tex_body)
+
+writeLines(tex_doc, "cost_table.tex")
+```
+
+```{bash Compile cost table PDF, engine.opts=""}
+# cd "$(pwd 2>/dev/null || echo .)"
+# pdflatex -interaction=nonstopmode cost_table.tex > cost_table_latex.log 2>&1
+# echo "Exit status: $?"
+# ls -la cost_table.pdf
+``` 
+
+## Fitting
+```{r results function}
+library (future.apply)
+
+sim_results_heart <- function (b_grid, mp_name, bp_name, costs_name,
+                                parallel = FALSE, workers = 2,
+                                progress = TRUE, progress_file = NULL) {
+
+  n_runs <- length (b_grid)
+
+  if (!is.null (progress_file)) progress_file <- path.expand (progress_file)
+  
+  rss_mb <- function () {
+    as.numeric (strsplit (readLines ("/proc/self/statm", n = 1L), " ")[[1L]][2L]) *
+      4096 / 1024^2
+  }
+
+  say <- function (event, i, b, secs = NA_real_) {
+    if (!progress) return (invisible (NULL))
+    line <- sprintf (
+      "[%s] pid %6d | %-5s %2d/%2d | b=%.2f | rss=%6.0f MB%s\n",
+      format (Sys.time (), "%H:%M:%S"), Sys.getpid (), event, i, n_runs,
+      b, rss_mb (),
+      if (is.na (secs)) "" else sprintf (" | took %6.1f s", secs)
+    )
+    if (is.null (progress_file)) cat (line)
+    else cat (line, file = progress_file, append = TRUE)
+  }
+
+  run_one <- function (i) {
+    b_i <- b_grid [i]
+
+    # Same seed on every iteration, deliberately: b and modelprior are the
+    # only things we want to vary across runs
+    set.seed (master_seed)
+
+    say ("START", i, b_i)
+    t0 <- Sys.time ()
+
+    res <- run_one_heart (
+      mp_name    = mp_name,
+      bp_name    = bp_name,
+      b_grid     = b_grid,
+      costs_name = costs_name,
+      i          = i
+    )
+
+    say ("DONE", i, b_i, as.numeric (difftime (Sys.time (), t0, units = "secs")))
+    res
+  }
+
+  if (parallel) {
+    # multisession, deliberately, not multicore: a fork inherits an already
+    # multi-threaded BLAS, and workers end up fighting over cores.
+    plan (multisession, workers = workers)
+    on.exit (plan (sequential), add = TRUE)
+
+    pip_list <- future_lapply (
+      X = seq_along (b_grid),
+      FUN = run_one,
+      future.seed = FALSE
+    )
+    message ("sim_results_heart used: ", future::nbrOfWorkers (), " workers")
+  } else {
+    pip_list <- lapply (X = seq_along (b_grid), FUN = run_one)
+  }
+
+  pips_list              <- lapply (pip_list, `[[`, "PIPs")
+  hpm_cost_list          <- lapply (pip_list, `[[`, "HPM_cost")
+  mpm_dummy_cost_list    <- lapply (pip_list, `[[`, "MPM_dummy_cost")
+  mpm_grouped_cost_list  <- lapply (pip_list, `[[`, "MPM_grouped_cost")
+  hpm_cstat_list         <- lapply (pip_list, `[[`, "HPM_Cstat")
+  mpm_dummy_cstat_list   <- lapply (pip_list, `[[`, "MPM_dummy_Cstat")
+  mpm_grouped_cstat_list <- lapply (pip_list, `[[`, "MPM_grouped_Cstat")
+
+  graph_pips <- do.call (rbind, pips_list)  # PIP´s at the level of variables only
+  rownames (graph_pips) <- b_grid
+  colnames (graph_pips) <- colnames(cleveland_heart)[1:13]
+
+  hpm_cost <- setNames (unlist (hpm_cost_list), b_grid)
+  mpm_dummy_cost <- setNames (unlist (mpm_dummy_cost_list), b_grid)
+  mpm_grouped_cost <- setNames (unlist (mpm_grouped_cost_list), b_grid)
+
+  hpm_cstat <- unlist (hpm_cstat_list)
+  if (!is.null (hpm_cstat)) names (hpm_cstat) <- b_grid
+  mpm_dummy_cstat <- unlist (mpm_dummy_cstat_list)
+  if (!is.null (mpm_dummy_cstat)) names (mpm_dummy_cstat) <- b_grid
+  mpm_grouped_cstat <- unlist (mpm_grouped_cstat_list)
+  if (!is.null (mpm_grouped_cstat)) names (mpm_grouped_cstat) <- b_grid
+
+  list (
+    pips = graph_pips,
+    hpm_cost = hpm_cost,
+    mpm_dummy_cost = mpm_dummy_cost,
+    mpm_grouped_cost = mpm_grouped_cost,
+    hpm_cstat = hpm_cstat,
+    mpm_dummy_cstat = mpm_dummy_cstat,
+    mpm_grouped_cstat = mpm_grouped_cstat,
+    mp_name = mp_name, costs_name = costs_name
+  )
+}
+```
+
+```{r Running the function}
+results_FNDConst <- sim_results_heart (
+  b_grid, "FND_Const", "unit_info", "no_discount", # "no_costs", "no_discount", "discounted"
+  parallel = TRUE, workers = length(b_grid), progress = FALSE #, progress_file = "~/sim_heart.log"
+)
+
+results_FNDSB <- sim_results_heart (
+  b_grid, "FND_SB", "unit_info", "no_discount", #  "no_costs", "no_discount", "discounted"
+  parallel = TRUE, workers = length(b_grid), progress = FALSE #, progress_file = "~/sim_heart.log"
+)
+```
+
+```{r Model cost plot function}
+library (ggplot2)
+
+plot_model_cost <- function (results, title = NULL) {
+
+  b <- as.numeric (names (results$hpm_cost))
+
+  df_cost <- data.frame (
+    b = rep (b, 3),
+    cost = c (results$hpm_cost, results$mpm_dummy_cost, results$mpm_grouped_cost),
+    `Estimator` = rep (
+      c ("HPM", "MPM (dummies)", "MPM (grouped)"),
+      each = length (b)
+    ),
+    check.names = FALSE
+  )
+
+  ggplot (df_cost, aes (x = b, y = cost, colour = Estimator)) +
+    geom_step (linewidth = 0.8) +
+    scale_colour_manual (
+      name = "Estimator",
+      values = c (
+        "HPM" = "black",
+        "MPM (dummies)" = "red",
+        "MPM (grouped)" = "blue"
+      )
+    ) +
+    labs (
+      title = title,
+      x = "Cost Penalty Tuning Parameter 'b'",
+      y = "(Real) Model Cost" # \n(per patient/observation)
+    ) +
+    ylim (0, 400) +
+    theme_bw () +
+    theme (
+      legend.position = "right",
+      plot.title = element_text (face = "bold"),
+      axis.title.x = element_text (face = "bold"),
+      axis.title.y = element_text (face = "bold"),
+      legend.title = element_text (face = "bold")
+    )
+}
+# plot_model_cost (results_FNDConst, "FND-Const")
+# plot_model_cost (results_FNDSB, "FND-SB")
+```
+
+```{r Saving the model cost plots}
+out_dir <- path.expand ("~/heart_experiments")
+if (!dir.exists (out_dir)) dir.create (out_dir)
+
+cost_graphs <- list (results_FNDConst, results_FNDSB)
+
+for (res in cost_graphs) {
+
+  p <- plot_model_cost (res, paste0 (res$mp_name, " (", res$costs_name, ")"))
+
+  base_file <- file.path (
+    out_dir, paste0 ("model_cost_", res$mp_name, "_", res$costs_name)
+  )
+
+  # ggsave (paste0 (base_file, ".png"), plot = p, width = 7, height = 5, dpi = 300)
+  ggsave (paste0 (base_file, ".pdf"), plot = p, width = 7, height = 5)
+}
+```
+
+```{r C-statistic plot function}
+library (ggplot2)
+
+plot_cstat <- function (results, title = NULL) {
+
+  b <- as.numeric (names (results$hpm_cstat))
+
+  df_cstat <- data.frame (
+    b = rep (b, 3),
+    cstat = c (results$hpm_cstat, results$mpm_dummy_cstat, results$mpm_grouped_cstat),
+    `Estimator` = rep (
+      c ("HPM", "MPM (dummies)", "MPM (grouped)"),
+      each = length (b)
+    ),
+    check.names = FALSE
+  )
+
+  ggplot (df_cstat, aes (x = b, y = cstat, colour = Estimator)) +
+    geom_step (linewidth = 0.8) +
+    scale_colour_manual (
+      name = "Estimator",
+      values = c (
+        "HPM" = "black",
+        "MPM (dummies)" = "red",
+        "MPM (grouped)" = "blue"
+      )
+    ) +
+    labs (
+      title = title,
+      x = "Cost Penalty Tuning Parameter 'b'",
+      y = "C-statistic"
+    ) +
+    scale_y_continuous (limits = c (0.75, 1), expand = c (0.01, 0.01)) +
+    theme_bw () +
+    theme (
+      legend.position = "right",
+      plot.title = element_text (face = "bold"),
+      axis.title.x = element_text (face = "bold"),
+      axis.title.y = element_text (face = "bold"),
+      legend.title = element_text (face = "bold")
+    )
+}
+# plot_cstat (results_FNDConst, "FND-Const")
+# plot_cstat (results_FNDSB, "FND-SB")
+```
+
+```{r Saving the C-statistic plots}
+cstat_graphs <- list (results_FNDConst, results_FNDSB)
+
+for (res in cstat_graphs) {
+
+  p <- plot_cstat (res, paste0 (res$mp_name, " (", res$costs_name, ")"))
+
+  base_file <- file.path (
+    out_dir, paste0 ("cstat_", res$mp_name, "_", res$costs_name)
+  )
+
+  # ggsave (paste0 (base_file, ".png"), plot = p, width = 7, height = 5, dpi = 300)
+  ggsave (paste0 (base_file, ".pdf"), plot = p, width = 7, height = 5) # vector graphics: sharp at any print size in LaTeX
+}
+```
+
+```{r Inclusion path plot function}
+library (reshape2)   # melt()
+library (ggplot2)
+library (RColorBrewer)
+
+# Same order as that of cleveland_heart / old_costs_mat.
+predictor_labels <- c (
+  age      = "age",
+  sex      = "sex",
+  cp       = "chest pain",
+  trestbps = "resting BP",
+  chol     = "cholesterol",
+  fbs      = "blood sugar",
+  restecg  = "EKG",
+  thalach  = "heart rate",
+  exang    = "exercise angina",
+  oldpeak  = "ST depression",
+  slope    = "peak ST segment",
+  ca       = "major vessels",
+  thal     = "defect type"
+)
+
+plot_inclusion_path <- function (results, title = "Inclusion Path produced by ECP") {
+
+  marginal_cost <- diag (old_costs_mat [, -1])
+  ord <- names (sort (marginal_cost, decreasing = FALSE))
+
+  pips_ord <- results$pips [, ord, drop = FALSE]
+  colnames (pips_ord) <- predictor_labels [ord]
+
+  df_long <- melt (
+    pips_ord,
+    varnames = c ("b", "Predictor"),
+    value.name = "PIP"
+  )
+  df_long$b <- as.numeric (as.character (df_long$b))  # melt() makes it factor
+  df_long$Predictor <- factor (df_long$Predictor, levels = predictor_labels [ord])
+
+  n_pred <- length (ord)
+  cols <- colorRampPalette (brewer.pal (9, "Reds")) (n_pred)
+
+  ggplot (df_long,
+         aes (x = b, y = PIP,
+              colour   = Predictor,
+              linetype = Predictor,
+              group    = Predictor)) +
+    geom_line (linewidth = 1) +
+    scale_colour_manual (values = cols) +
+    scale_linetype_manual (values = rep_len (1:6, n_pred)) +
+    scale_y_continuous (limits = c (0, 1), expand = c (0.01, 0.01)) +
+    scale_x_continuous (expand = c (0, 0)) +
+    labs (title = title,
+          x = "Cost Penalty Tuning Parameter 'b'",
+          y = "PIPs") +
+    theme_minimal (base_size = 13) +
+    theme (
+      plot.title       = element_text (face = "bold", hjust = 0.5),
+      axis.title.x     = element_text (face = "bold"),
+      axis.title.y     = element_text (face = "bold"),
+      legend.title     = element_text (face = "bold"),
+      legend.key.width = unit (1.4, "cm")
+    )
+}
+```
+
+```{r Saving the inclusion path plots}
+inclusion_graphs <- list (results_FNDConst, results_FNDSB)
+
+for (res in inclusion_graphs) {
+
+  p <- plot_inclusion_path (
+    res, paste0 ("Inclusion Path (", res$mp_name, ", ", res$costs_name, ")")
+  )
+
+  base_file <- file.path (
+    out_dir, paste0 ("inclusion_path_", res$mp_name, "_", res$costs_name)
+  )
+
+  # ggsave (paste0 (base_file, ".png"), plot = p, width = 9, height = 5, dpi = 300)
+  ggsave (paste0 (base_file, ".pdf"), plot = p, width = 9, height = 5) # vector graphics: sharp at any print size in LaTeX
+}
+```
+
+```{r Run Above}
+# Run Above
+```
