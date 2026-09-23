@@ -1,7 +1,7 @@
 # Cost-Adjusted Bayesian Model Selection in the Presence of Factors 
 
 ## Repository contents
-- `thesis/` – Final thesis manuscript
+- `thesis/` – Thesis manuscript
 - `presentation/` – Defense slides
 - `experiments/` – Experimental results and analysis
 - `figures/` – Images used in the thesis
